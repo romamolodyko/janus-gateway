@@ -66,6 +66,7 @@ int janus_websockets_send_message(janus_transport_session *transport, void *requ
 void janus_websockets_session_created(janus_transport_session *transport, guint64 session_id);
 void janus_websockets_session_over(janus_transport_session *transport, guint64 session_id, gboolean timeout, gboolean claimed);
 void janus_websockets_session_claimed(janus_transport_session *transport, guint64 session_id);
+json_t *janus_websockets_query_transport(json_t *request);
 
 
 /* Transport setup */
@@ -89,6 +90,8 @@ static janus_transport janus_websockets_transport =
 		.session_created = janus_websockets_session_created,
 		.session_over = janus_websockets_session_over,
 		.session_claimed = janus_websockets_session_claimed,
+
+		.query_transport = janus_websockets_query_transport,
 	);
 
 /* Transport creator */
@@ -113,6 +116,21 @@ static janus_mutex writable_mutex;
 
 /* JSON serialization options */
 static size_t json_format = JSON_INDENT(3) | JSON_PRESERVE_ORDER;
+
+/* Parameter validation (for tweaking and queries via Admin API) */
+static struct janus_json_parameter request_parameters[] = {
+	{"request", JSON_STRING, JANUS_JSON_PARAM_REQUIRED}
+};
+static struct janus_json_parameter configure_parameters[] = {
+	{"events", JANUS_JSON_BOOL, 0},
+	{"json", JSON_STRING, 0},
+	{"logging", JSON_STRING, 0},
+};
+/* Error codes (for the tweaking and queries via Admin API) */
+#define JANUS_WEBSOCKETS_ERROR_INVALID_REQUEST		411
+#define JANUS_WEBSOCKETS_ERROR_MISSING_ELEMENT		412
+#define JANUS_WEBSOCKETS_ERROR_INVALID_ELEMENT		413
+#define JANUS_WEBSOCKETS_ERROR_UNKNOWN_ERROR		499
 
 
 /* Logging */
@@ -242,6 +260,7 @@ static const char *janus_websockets_reason_string(enum lws_callback_reasons reas
 		CASE_STR(LWS_CALLBACK_HTTP_BODY_COMPLETION);
 		CASE_STR(LWS_CALLBACK_HTTP_FILE_COMPLETION);
 		CASE_STR(LWS_CALLBACK_HTTP_WRITEABLE);
+		CASE_STR(LWS_CALLBACK_ADD_HEADERS);
 		CASE_STR(LWS_CALLBACK_FILTER_NETWORK_CONNECTION);
 		CASE_STR(LWS_CALLBACK_FILTER_HTTP_CONNECTION);
 		CASE_STR(LWS_CALLBACK_SERVER_NEW_CLIENT_INSTANTIATED);
@@ -306,6 +325,10 @@ static char *janus_websockets_get_interface_name(const char *ip) {
 	freeifaddrs(addrs);
 	return NULL;
 }
+
+/* Custom Access-Control-Allow-Origin value, if specified */
+static char *allow_origin = NULL;
+static gboolean enforce_cors = FALSE;
 
 /* WebSockets ACL list for both Janus and Admin API */
 static GList *janus_websockets_access_list = NULL, *janus_websockets_admin_access_list = NULL;
@@ -390,6 +413,7 @@ int janus_websockets_init(janus_transport_callbacks *callback, const char *confi
 		janus_config_print(config);
 		janus_config_category *config_general = janus_config_get_create(config, NULL, janus_config_type_category, "general");
 		janus_config_category *config_admin = janus_config_get_create(config, NULL, janus_config_type_category, "admin");
+		janus_config_category *config_cors = janus_config_get_create(config, NULL, janus_config_type_category, "cors");
 		janus_config_category *config_certs = janus_config_get_create(config, NULL, janus_config_type_category, "certificates");
 
 		/* Handle configuration */
@@ -503,6 +527,20 @@ int janus_websockets_init(janus_transport_callbacks *callback, const char *confi
 			}
 			g_strfreev(list);
 			list = NULL;
+		}
+
+		/* Any custom value for the Access-Control-Allow-Origin header? */
+		item = janus_config_get(config, config_cors, janus_config_type_item, "allow_origin");
+		if(item && item->value) {
+			allow_origin = g_strdup(item->value);
+			JANUS_LOG(LOG_INFO, "Restricting Access-Control-Allow-Origin to '%s'\n", allow_origin);
+		}
+		if(allow_origin != NULL) {
+			item = janus_config_get(config, config_cors, janus_config_type_item, "enforce_cors");
+			if(item && item->value && janus_is_true(item->value)) {
+				enforce_cors = TRUE;
+				JANUS_LOG(LOG_INFO, "Going to enforce CORS by rejecting WebSocket connections\n");
+			}
 		}
 
 		/* Check if we need to enable the transport level ping/pong mechanism */
@@ -997,6 +1035,140 @@ void janus_websockets_session_claimed(janus_transport_session *transport, guint6
 	/* FIXME Is the above statement accurate? Should we care? Unlike the HTTP transport, there is no hashtable to update */
 }
 
+json_t *janus_websockets_query_transport(json_t *request) {
+	if(g_atomic_int_get(&stopping) || !g_atomic_int_get(&initialized)) {
+		return NULL;
+	}
+	/* We can use this request to dynamically change the behaviour of
+	 * the transport plugin, and/or query for some specific information */
+	json_t *response = json_object();
+	int error_code = 0;
+	char error_cause[512];
+	JANUS_VALIDATE_JSON_OBJECT(request, request_parameters,
+		error_code, error_cause, TRUE,
+		JANUS_WEBSOCKETS_ERROR_MISSING_ELEMENT, JANUS_WEBSOCKETS_ERROR_INVALID_ELEMENT);
+	if(error_code != 0)
+		goto plugin_response;
+	/* Get the request */
+	const char *request_text = json_string_value(json_object_get(request, "request"));
+	if(!strcasecmp(request_text, "configure")) {
+		/* We only allow for the configuration of some basic properties:
+		 * changing more complex things (e.g., port to bind to, etc.)
+		 * would likely require restarting backends, so just too much */
+		JANUS_VALIDATE_JSON_OBJECT(request, configure_parameters,
+			error_code, error_cause, TRUE,
+			JANUS_WEBSOCKETS_ERROR_MISSING_ELEMENT, JANUS_WEBSOCKETS_ERROR_INVALID_ELEMENT);
+		/* Check if we now need to send events to handlers */
+		json_object_set_new(response, "result", json_integer(200));
+		json_t *notes = NULL;
+		gboolean events = json_is_true(json_object_get(request, "events"));
+		if(events && !gateway->events_is_enabled()) {
+			/* Notify that this will be ignored */
+			notes = json_array();
+			json_array_append_new(notes, json_string("Event handlers disabled at the core level"));
+			json_object_set_new(response, "notes", notes);
+		}
+		if(events != notify_events) {
+			notify_events = events;
+			if(!notify_events && gateway->events_is_enabled()) {
+				JANUS_LOG(LOG_WARN, "Notification of events to handlers disabled for %s\n", JANUS_WEBSOCKETS_NAME);
+			}
+		}
+		const char *indentation = json_string_value(json_object_get(request, "json"));
+		if(indentation != NULL) {
+			if(!strcasecmp(indentation, "indented")) {
+				/* Default: indented, we use three spaces for that */
+				json_format = JSON_INDENT(3) | JSON_PRESERVE_ORDER;
+			} else if(!strcasecmp(indentation, "plain")) {
+				/* Not indented and no new lines, but still readable */
+				json_format = JSON_INDENT(0) | JSON_PRESERVE_ORDER;
+			} else if(!strcasecmp(indentation, "compact")) {
+				/* Compact, so no spaces between separators */
+				json_format = JSON_COMPACT | JSON_PRESERVE_ORDER;
+			} else {
+				JANUS_LOG(LOG_WARN, "Unsupported JSON format option '%s', ignoring tweak\n", indentation);
+				/* Notify that this will be ignored */
+				if(notes == NULL) {
+					notes = json_array();
+					json_object_set_new(response, "notes", notes);
+				}
+				json_array_append_new(notes, json_string("Ignored unsupported indentation format"));
+			}
+		}
+		const char *logging = json_string_value(json_object_get(request, "logging"));
+		if(logging != NULL) {
+			/* libwebsockets uses a mask to set log levels, as documented here:
+			 * https://libwebsockets.org/lws-api-doc-master/html/group__log.html */
+			if(strstr(logging, "none")) {
+				/* Disable libwebsockets logging completely (the default) */
+			} else if(strstr(logging, "all")) {
+				/* Enable all libwebsockets logging */
+				ws_log_level = LLL_ERR | LLL_WARN | LLL_NOTICE | LLL_INFO |
+					LLL_DEBUG | LLL_PARSER | LLL_HEADER | LLL_EXT |
+#if (LWS_LIBRARY_VERSION_MAJOR >= 2 && LWS_LIBRARY_VERSION_MINOR >= 2) || (LWS_LIBRARY_VERSION_MAJOR >= 3)
+					LLL_CLIENT | LLL_LATENCY | LLL_USER | LLL_COUNT;
+#else
+					LLL_CLIENT | LLL_LATENCY | LLL_COUNT;
+#endif
+			} else {
+				/* Only enable some of the properties */
+				ws_log_level = 0;
+				if(strstr(logging, "err"))
+					ws_log_level |= LLL_ERR;
+				if(strstr(logging, "warn"))
+					ws_log_level |= LLL_WARN;
+				if(strstr(logging, "notice"))
+					ws_log_level |= LLL_NOTICE;
+				if(strstr(logging, "info"))
+					ws_log_level |= LLL_INFO;
+				if(strstr(logging, "debug"))
+					ws_log_level |= LLL_DEBUG;
+				if(strstr(logging, "parser"))
+					ws_log_level |= LLL_PARSER;
+				if(strstr(logging, "header"))
+					ws_log_level |= LLL_HEADER;
+				if(strstr(logging, "ext"))
+					ws_log_level |= LLL_EXT;
+				if(strstr(logging, "client"))
+					ws_log_level |= LLL_CLIENT;
+				if(strstr(logging, "latency"))
+					ws_log_level |= LLL_LATENCY;
+#if (LWS_LIBRARY_VERSION_MAJOR >= 2 && LWS_LIBRARY_VERSION_MINOR >= 2) || (LWS_LIBRARY_VERSION_MAJOR >= 3)
+				if(strstr(logging, "user"))
+					ws_log_level |= LLL_USER;
+#endif
+				if(strstr(logging, "count"))
+					ws_log_level |= LLL_COUNT;
+			}
+			JANUS_LOG(LOG_INFO, "libwebsockets logging: %d\n", ws_log_level);
+			lws_set_log_level(ws_log_level, janus_websockets_log_emit_function);
+		}
+	} else if(!strcasecmp(request_text, "connections")) {
+		/* Return the number of active connections currently handled by the plugin */
+		json_object_set_new(response, "result", json_integer(200));
+#if (LWS_LIBRARY_VERSION_MAJOR >= 3)
+		janus_mutex_lock(&writable_mutex);
+		guint connections = g_hash_table_size(clients);
+		janus_mutex_unlock(&writable_mutex);
+		json_object_set_new(response, "connections", json_integer(connections));
+#endif
+	} else {
+		JANUS_LOG(LOG_VERB, "Unknown request '%s'\n", request_text);
+		error_code = JANUS_WEBSOCKETS_ERROR_INVALID_REQUEST;
+		g_snprintf(error_cause, 512, "Unknown request '%s'", request_text);
+	}
+
+plugin_response:
+		{
+			if(error_code != 0) {
+				/* Prepare JSON error event */
+				json_object_set_new(response, "error_code", json_integer(error_code));
+				json_object_set_new(response, "error", json_string(error_cause));
+			}
+			return response;
+		}
+}
+
 
 /* Thread */
 void *janus_websockets_thread(void *data) {
@@ -1118,6 +1290,66 @@ static int janus_websockets_common_callback(
 			}
 			return 0;
 		}
+		case LWS_CALLBACK_ADD_HEADERS: {
+			/* If CORS is enabled, check the headers and add our own */
+			struct lws_process_html_args *args = (struct lws_process_html_args *)in;
+			if(allow_origin == NULL) {
+				/* Return a wildcard for the Access-Control-Allow-Origin header */
+				if(lws_add_http_header_by_name(wsi,
+						(unsigned char *)"Access-Control-Allow-Origin:",
+						(unsigned char *)"*", 1,
+						(unsigned char **)&args->p,
+						(unsigned char *)args->p + args->max_len))
+					return 1;
+			} else {
+				/* Return the configured origin in the header */
+				if(lws_add_http_header_by_name(wsi,
+						(unsigned char *)"Access-Control-Allow-Origin:",
+						(unsigned char *)allow_origin, strlen(allow_origin),
+						(unsigned char **)&args->p,
+						(unsigned char *)args->p + args->max_len))
+					return 1;
+				char origin[256], headers[256], methods[256];
+				origin[0] = '\0';
+				headers[0] = '\0';
+				methods[0] = '\0';
+				int olen = lws_hdr_total_length(wsi, WSI_TOKEN_ORIGIN);
+				if(olen > 0 && olen < 255) {
+					lws_hdr_copy(wsi, origin, sizeof(origin), WSI_TOKEN_ORIGIN);
+				}
+				int hlen = lws_hdr_total_length(wsi, WSI_TOKEN_HTTP_AC_REQUEST_HEADERS);
+				if(hlen > 0 && hlen < 255) {
+					lws_hdr_copy(wsi, headers, sizeof(headers), WSI_TOKEN_HTTP_AC_REQUEST_HEADERS);
+					if(lws_add_http_header_by_name(wsi,
+							(unsigned char *)"Access-Control-Allow-Headers:",
+							(unsigned char *)headers, strlen(headers),
+							(unsigned char **)&args->p,
+							(unsigned char *)args->p + args->max_len))
+						return 1;
+				}
+#if (LWS_LIBRARY_VERSION_MAJOR >= 3 && LWS_LIBRARY_VERSION_MINOR >= 2) || (LWS_LIBRARY_VERSION_MAJOR >= 4)
+				int mlen = lws_hdr_custom_length(wsi, "Access-Control-Request-Methods", strlen("Access-Control-Request-Methods"));
+				if(mlen > 0 && mlen < 255) {
+					lws_hdr_custom_copy(wsi, methods, sizeof(methods),
+						"Access-Control-Request-Methods", strlen("Access-Control-Request-Methods"));
+					if(lws_add_http_header_by_name(wsi,
+							(unsigned char *)"Access-Control-Allow-Methods:",
+							(unsigned char *)methods, strlen(methods),
+							(unsigned char **)&args->p,
+							(unsigned char *)args->p + args->max_len))
+						return 1;
+				}
+#endif
+				/* WebSockets are not bound by CORS, but we can enforce this */
+				if(enforce_cors) {
+					if(strlen(origin) == 0 || strstr(origin, allow_origin) != origin) {
+						JANUS_LOG(LOG_ERR, "[%s-%p] Invalid origin, rejecting...\n", log_prefix, wsi);
+						return -1;
+					}
+				}
+			}
+			return 0;
+		}
 		case LWS_CALLBACK_RECEIVE: {
 			JANUS_LOG(LOG_HUGE, "[%s-%p] Got %zu bytes:\n", log_prefix, wsi, len);
 			if(ws_client == NULL || ws_client->wsi == NULL) {
@@ -1126,6 +1358,10 @@ static int janus_websockets_common_callback(
 			}
 			if(g_atomic_int_get(&ws_client->destroyed))
 				return 0;
+#if (LWS_LIBRARY_VERSION_MAJOR >= 4)
+			/* Refresh the lws connection validity (avoid sending a ping) */
+			lws_validity_confirmed(ws_client->wsi);
+#endif
 			/* Is this a new message, or part of a fragmented one? */
 			const size_t remaining = lws_remaining_packet_payload(wsi);
 			if(ws_client->incoming == NULL) {
